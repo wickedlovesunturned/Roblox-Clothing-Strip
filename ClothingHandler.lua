@@ -42,7 +42,7 @@ local function getData(player)
 	return playerData[player.UserId]
 end
 
--- Method 1: AccessoryType (R15 / proper tagged accessories)
+-- Method 1: AccessoryType (R15 tagged)
 local ACCESSORY_TYPE_SLOTS = {
 	hat   = { Enum.AccessoryType.Hat },
 	hair  = { Enum.AccessoryType.Hair },
@@ -50,7 +50,7 @@ local ACCESSORY_TYPE_SLOTS = {
 	waist = { Enum.AccessoryType.Waist },
 }
 
--- Method 2: Attachment names inside Handle (R6 / ACS / untagged accessories)
+-- Method 2: Attachment names inside Handle (R6 / ACS / untagged)
 local ATTACHMENT_SLOTS = {
 	hat   = { "HatAttachment", "TopScaleAttachment", "FaceFrontAttachment", "FaceBackAttachment" },
 	hair  = { "HairAttachment" },
@@ -58,66 +58,35 @@ local ATTACHMENT_SLOTS = {
 	waist = { "WaistBackAttachment", "WaistFrontAttachment", "WaistCenterAttachment" },
 }
 
--- Returns the slot name for an accessory using both methods
 local function getAccessorySlot(accessory)
-	-- Method 1: try AccessoryType first
 	if accessory.AccessoryType ~= Enum.AccessoryType.Unknown then
 		for slot, types in pairs(ACCESSORY_TYPE_SLOTS) do
 			for _, t in ipairs(types) do
-				if accessory.AccessoryType == t then
-					return slot
-				end
+				if accessory.AccessoryType == t then return slot end
 			end
 		end
 	end
-
-	-- Method 2: fallback to attachment name inside Handle
 	local handle = accessory:FindFirstChild("Handle")
 	if handle then
-		for slot, attachNames in pairs(ATTACHMENT_SLOTS) do
-			for _, attachName in ipairs(attachNames) do
-				if handle:FindFirstChild(attachName) then
-					return slot
-				end
+		for slot, names in pairs(ATTACHMENT_SLOTS) do
+			for _, name in ipairs(names) do
+				if handle:FindFirstChild(name) then return slot end
 			end
 		end
 	end
-
 	return nil
 end
 
-local function buildDesc(originalDesc, state)
-	local desc = originalDesc:Clone()
-
-	if state.shirt then
-		desc.Shirt         = 0
-		desc.GraphicTShirt = 0
-	end
-	if state.pants then
-		desc.Pants = 0
-	end
-
-	-- Strip toggled accessory slots via Method 1 (AccessoryType) on the description
-	local removedTypes = {}
-	for slot, removed in pairs(state) do
-		if removed and ACCESSORY_TYPE_SLOTS[slot] then
-			for _, t in ipairs(ACCESSORY_TYPE_SLOTS[slot]) do
-				removedTypes[t] = true
+-- Strip toggled accessories directly off the character
+local function stripAccessories(character, state)
+	for _, obj in ipairs(character:GetChildren()) do
+		if obj:IsA("Accessory") then
+			local slot = getAccessorySlot(obj)
+			if slot and state[slot] then
+				obj:Destroy()
 			end
 		end
 	end
-
-	if next(removedTypes) then
-		local filtered = {}
-		for _, acc in ipairs(desc:GetAccessories(false)) do
-			if not removedTypes[acc.AccessoryType] then
-				table.insert(filtered, acc)
-			end
-		end
-		desc:SetAccessories(filtered, false)
-	end
-
-	return desc
 end
 
 local function applyToPlayer(player)
@@ -130,22 +99,30 @@ local function applyToPlayer(player)
 	local humanoid = character:FindFirstChildOfClass("Humanoid")
 	if not humanoid then return end
 
-	-- Apply modified description (Method 1 handles shirt/pants + tagged accessories)
-	humanoid:ApplyDescription(buildDesc(data.originalDesc, data.state))
+	-- Build a clean desc clone
+	local desc = data.originalDesc:Clone()
 
-	-- After ApplyDescription re-adds accessories, sweep with Method 2
-	-- to catch anything that slipped through (R6/ACS untagged accessories)
+	-- Zero out shirt/pants if toggled off
+	if data.state.shirt then
+		desc.Shirt         = 0
+		desc.GraphicTShirt = 0
+	end
+	if data.state.pants then
+		desc.Pants = 0
+	end
+
+	-- Apply — this re-adds everything from the saved original desc
+	humanoid:ApplyDescription(desc)
+
+	-- After apply, strip accessories that are still toggled off
+	-- task.defer runs next frame, after ApplyDescription finishes adding accessories
+	local stateSnapshot = {}
+	for k, v in pairs(data.state) do stateSnapshot[k] = v end
+
 	task.defer(function()
 		character = player.Character
 		if not character then return end
-		for _, obj in ipairs(character:GetChildren()) do
-			if obj:IsA("Accessory") then
-				local slot = getAccessorySlot(obj)
-				if slot and data.state[slot] then
-					obj:Destroy()
-				end
-			end
-		end
+		stripAccessories(character, stateSnapshot)
 	end)
 
 	SyncClothing:FireClient(player, data.state)
@@ -157,16 +134,21 @@ local function onCharacterAdded(player, character)
 
 	local data = getData(player)
 
-	local ok, desc = pcall(function()
-		return Players:GetHumanoidDescriptionFromUserId(player.UserId)
-	end)
+	-- Wait for ACS and game systems to finish dressing the character
+	-- then snapshot whatever is actually on the character as the source of truth
+	task.wait(2)
 
-	data.originalDesc = (ok and desc) or humanoid:GetAppliedDescription()
+	character = player.Character
+	if not character then return end
+	humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return end
 
+	data.originalDesc = humanoid:GetAppliedDescription()
+
+	-- Re-apply state if any slots are toggled (e.g. after death)
 	local hasAny = false
 	for _, v in pairs(data.state) do if v then hasAny = true; break end end
 	if hasAny then
-		task.wait(0.5)
 		applyToPlayer(player)
 	end
 end
