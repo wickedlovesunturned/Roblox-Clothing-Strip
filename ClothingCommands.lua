@@ -8,7 +8,7 @@
  *
  *  W I C K E D   D E V E L O P M E N T
  * ─────────────────────────────────────────────
- *  Project  : Clothing Strip System
+ *  Project  : wClothing
  *  Author   : Wicked
  *  Version  : 1.0.0
  *  Built    : 2026
