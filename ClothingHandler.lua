@@ -10,7 +10,7 @@
  * ─────────────────────────────────────────────
  *  Project  : wClothing
  *  Author   : Wicked
- *  Version  : 1.0.0
+ *  Version  : 1.0.1
  *  Built    : 2026
  * ─────────────────────────────────────────────
  *  © Wicked Development — All Rights Reserved
@@ -38,11 +38,12 @@ local SyncClothing   = getRemote("SyncClothing")
 local playerData = {}
 
 local function getData(player)
-	playerData[player.UserId] = playerData[player.UserId] or { state = {}, originalDesc = nil }
+	if not playerData[player.UserId] then
+		playerData[player.UserId] = { state = {}, shirtId = 0, pantsId = 0, hidden = {} }
+	end
 	return playerData[player.UserId]
 end
 
--- Method 1: AccessoryType (R15 tagged)
 local ACCESSORY_TYPE_SLOTS = {
 	hat   = { Enum.AccessoryType.Hat },
 	hair  = { Enum.AccessoryType.Hair },
@@ -50,9 +51,8 @@ local ACCESSORY_TYPE_SLOTS = {
 	waist = { Enum.AccessoryType.Waist },
 }
 
--- Method 2: Attachment names inside Handle (R6 / ACS / untagged)
 local ATTACHMENT_SLOTS = {
-	hat   = { "HatAttachment", "TopScaleAttachment", "FaceFrontAttachment", "FaceBackAttachment" },
+	hat   = { "HatAttachment", "TopScaleAttachment" },
 	hair  = { "HairAttachment" },
 	back  = { "BodyBackAttachment" },
 	waist = { "WaistBackAttachment", "WaistFrontAttachment", "WaistCenterAttachment" },
@@ -69,103 +69,153 @@ local function getAccessorySlot(accessory)
 	local handle = accessory:FindFirstChild("Handle")
 	if handle then
 		for slot, names in pairs(ATTACHMENT_SLOTS) do
-			for _, name in ipairs(names) do
-				if handle:FindFirstChild(name) then return slot end
+			for _, attachName in ipairs(names) do
+				if handle:FindFirstChild(attachName) then return slot end
 			end
 		end
 	end
 	return nil
 end
 
--- Strip toggled accessories directly off the character
-local function stripAccessories(character, state)
-	for _, obj in ipairs(character:GetChildren()) do
-		if obj:IsA("Accessory") then
-			local slot = getAccessorySlot(obj)
-			if slot and state[slot] then
-				obj:Destroy()
-			end
-		end
+local function setAccessoryVisible(accessory, visible)
+	local handle = accessory:FindFirstChild("Handle")
+	if not handle then return end
+	local t = visible and 0 or 1
+	handle.Transparency = t
+	for _, part in ipairs(handle:GetDescendants()) do
+		if part:IsA("BasePart") then part.Transparency = t end
+	end
+	for _, d in ipairs(handle:GetDescendants()) do
+		if d:IsA("Decal") or d:IsA("Texture") then d.Transparency = t end
 	end
 end
 
-local function applyToPlayer(player)
+local function removeAccessories(player, slot)
+	local character = player.Character
+	if not character then return false end
 	local data = getData(player)
-	if not data.originalDesc then return end
+	if not data.hidden then data.hidden = {} end
+	data.hidden[slot] = data.hidden[slot] or {}
 
+	-- ✅ FIX: Check if already hidden (shouldn't re-hide)
+	if data.state[slot] then
+		print("[wClothing] Already hidden for slot:", slot)
+		return false
+	end
+
+	local count = 0
+	for _, obj in ipairs(character:GetChildren()) do
+		if obj:IsA("Accessory") and getAccessorySlot(obj) == slot then
+			setAccessoryVisible(obj, false)
+			table.insert(data.hidden[slot], obj)
+			count += 1
+			print("[wClothing] Hidden:", obj.Name)
+		end
+	end
+	if count == 0 then
+		print("[wClothing] Nothing found for slot:", slot)
+		return false
+	end
+	return true
+end
+
+local function restoreAccessories(player, slot)
+	local data = getData(player)
+	if not data.hidden or not data.hidden[slot] then
+		print("[wClothing] No hidden table for slot:", slot)
+		return
+	end
+	local count = 0
+	for _, obj in ipairs(data.hidden[slot]) do
+		if obj and obj.Parent then
+			setAccessoryVisible(obj, true)
+			count += 1
+			print("[wClothing] Shown:", obj.Name)
+		else
+			print("[wClothing] Accessory gone:", tostring(obj))
+		end
+	end
+	data.hidden[slot] = {}
+	print("[wClothing] Restored", count, "for slot:", slot)
+end
+
+local function removeClothing(player, slot)
+	local data = getData(player)
 	local character = player.Character
 	if not character then return end
-
 	local humanoid = character:FindFirstChildOfClass("Humanoid")
 	if not humanoid then return end
 
-	-- Build a clean desc clone
-	local desc = data.originalDesc:Clone()
-
-	-- Zero out shirt/pants if toggled off
-	if data.state.shirt then
+	local desc = humanoid:GetAppliedDescription()
+	if slot == "shirt" then
+		data.shirtId       = desc.Shirt
 		desc.Shirt         = 0
 		desc.GraphicTShirt = 0
+	elseif slot == "pants" then
+		data.pantsId = desc.Pants
+		desc.Pants   = 0
 	end
-	if data.state.pants then
-		desc.Pants = 0
-	end
-
-	-- Apply — this re-adds everything from the saved original desc
 	humanoid:ApplyDescription(desc)
-
-	-- After apply, strip accessories that are still toggled off
-	-- task.defer runs next frame, after ApplyDescription finishes adding accessories
-	local stateSnapshot = {}
-	for k, v in pairs(data.state) do stateSnapshot[k] = v end
-
-	task.defer(function()
-		character = player.Character
-		if not character then return end
-		stripAccessories(character, stateSnapshot)
-	end)
-
-	SyncClothing:FireClient(player, data.state)
+	data.state[slot] = true
 end
 
-local function onCharacterAdded(player, character)
-	local humanoid = character:WaitForChild("Humanoid", 5)
-	if not humanoid then return end
-
+local function restoreClothing(player, slot)
 	local data = getData(player)
-
-	-- Wait for ACS and game systems to finish dressing the character
-	-- then snapshot whatever is actually on the character as the source of truth
-	task.wait(2)
-
-	character = player.Character
+	local character = player.Character
 	if not character then return end
-	humanoid = character:FindFirstChildOfClass("Humanoid")
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
 	if not humanoid then return end
 
-	data.originalDesc = humanoid:GetAppliedDescription()
-
-	-- Re-apply state if any slots are toggled (e.g. after death)
-	local hasAny = false
-	for _, v in pairs(data.state) do if v then hasAny = true; break end end
-	if hasAny then
-		applyToPlayer(player)
+	local desc = humanoid:GetAppliedDescription()
+	if slot == "shirt" then
+		desc.Shirt         = data.shirtId
+		desc.GraphicTShirt = 0
+	elseif slot == "pants" then
+		desc.Pants = data.pantsId
 	end
+	humanoid:ApplyDescription(desc)
+	data.state[slot] = false
 end
 
-local VALID_SLOTS = { hat=true, hair=true, back=true, waist=true, shirt=true, pants=true }
+local CLOTHING_SLOTS  = { shirt = true, pants = true }
+local ACCESSORY_SLOTS = { hat = true, hair = true, back = true, waist = true }
+local VALID_SLOTS     = { hat=true, hair=true, back=true, waist=true, shirt=true, pants=true }
 
 ToggleClothing.OnServerEvent:Connect(function(player, slot)
 	slot = tostring(slot):lower()
 	if not VALID_SLOTS[slot] then return end
+
 	local data = getData(player)
-	data.state[slot] = not data.state[slot]
-	applyToPlayer(player)
+	print("[wClothing] Toggle:", slot, "| state:", tostring(data.state[slot]))
+
+	if ACCESSORY_SLOTS[slot] then
+		if data.state[slot] then
+			restoreAccessories(player, slot)
+			data.state[slot] = false
+		else
+			local ok = removeAccessories(player, slot)
+			if ok then
+				data.state[slot] = true
+			end
+		end
+	elseif CLOTHING_SLOTS[slot] then
+		if data.state[slot] then
+			restoreClothing(player, slot)
+		else
+			removeClothing(player, slot)
+		end
+	end
+
+	SyncClothing:FireClient(player, data.state)
 end)
 
 Players.PlayerAdded:Connect(function(player)
-	player.CharacterAdded:Connect(function(character)
-		onCharacterAdded(player, character)
+	player.CharacterAdded:Connect(function()
+		local data = getData(player)
+		data.state   = {}
+		data.shirtId = 0
+		data.pantsId = 0
+		data.hidden  = {}
 	end)
 end)
 
